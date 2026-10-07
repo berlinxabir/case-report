@@ -5,7 +5,6 @@ import asyncio
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from html import escape
 from dotenv import load_dotenv
 
 from telegram import Update
@@ -19,7 +18,7 @@ from telegram.ext import (
 )
 from supabase import create_client, Client
 
-# ------------------------ এনভায়রনমেন্ট ------------------------
+# ------------------------ এনভায়রনমেন্ট ------------------------
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -27,7 +26,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 if not all([TELEGRAM_TOKEN, SUPABASE_URL, SUPABASE_KEY]):
-    raise ValueError(".env ফাইলে সব ভেরিয়েবল সেট করুন")
+    raise ValueError(".env ফাইলে সব ভেরিয়েবল সেট করুন")
 
 # ------------------------ লগিং ------------------------
 logging.basicConfig(
@@ -38,16 +37,17 @@ logger = logging.getLogger(__name__)
 
 # ------------------------ Supabase ------------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-logger.info("Supabase ক্লায়েন্ট রেডি")
+logger.info("Supabase ক্লায়েন্ট রেডি")
 
-# ------------------------ কনভারসেশন স্টেট ------------------------
+# ------------------------ কনভারসেশন স্টেট (অথেন্টিকেশন) ------------------------
 ASK_EMAIL, ASK_PASSWORD = range(2)
 
-# ------------------------ ফাইল হ্যান্ডলিং ------------------------
+# ------------------------ ফাইল হ্যান্ডলিং (ব্লক ও অথেন্টিকেশন) ------------------------
 BLOCKED_FILE = "blocked_users.json"
 AUTH_FILE = "authenticated_users.json"
-ATTEMPT_FILE = "login_attempts.json"
+ATTEMPT_FILE = "login_attempts.json"      # চেষ্টার হিসাব রাখবে (বট রিস্টার্টে মুছে না)
 
+# ---------- ব্লকড ইউজার ----------
 def load_blocked() -> set:
     try:
         with open(BLOCKED_FILE, "r") as f:
@@ -67,6 +67,7 @@ def block_user(user_id: int):
     blocked.add(str(user_id))
     save_blocked(blocked)
 
+# ---------- অথেন্টিকেটেড ইউজার ----------
 def load_authenticated() -> set:
     try:
         with open(AUTH_FILE, "r") as f:
@@ -86,6 +87,7 @@ def authenticate_user(user_id: int):
     auth.add(str(user_id))
     save_authenticated(auth)
 
+# ---------- লগইন চেষ্টা ----------
 def load_attempts() -> dict:
     try:
         with open(ATTEMPT_FILE, "r") as f:
@@ -106,6 +108,7 @@ def increment_user_attempts(user_id: int):
     uid = str(user_id)
     attempts[uid] = attempts.get(uid, 0) + 1
     save_attempts(attempts)
+    # ৩ বার হলে ব্লক
     if attempts[uid] >= 3:
         block_user(user_id)
 
@@ -124,12 +127,8 @@ def is_phone_number(text: str) -> bool:
     cleaned = re.sub(r'[\s\-\(\)]', '', text)
     return bool(re.fullmatch(r'\+?\d{7,15}', cleaned))
 
-def safe(value) -> str:
-    if value is None or value == "":
-        return "—"
-    return escape(str(value))
-
 def format_datetime(iso_str: str) -> str:
+    """ISO স্ট্রিংকে বাংলাদেশ সময়ে '04 Jun 2026, 08:33 am' ফরম্যাটে রূপান্তর"""
     if not iso_str:
         return "N/A"
     try:
@@ -144,19 +143,13 @@ def format_datetime(iso_str: str) -> str:
     except Exception:
         return iso_str
 
-def split_datetime(iso_str: str) -> tuple[str, str]:
-    """(date_str, time_str) রিটার্ন করে আলাদা লাইনে দেখানোর জন্য"""
-    formatted = format_datetime(iso_str)
-    if "," in formatted:
-        d, t = formatted.split(",", 1)
-        return d.strip(), t.strip()
-    return formatted, "—"
-
 # ------------------------ ডাটাবেস অনুসন্ধান ------------------------
 def search_by_case_id(case_id: str) -> dict | None:
     try:
         response = supabase.table("withdrawals").select("*").eq("case_id", case_id.upper()).execute()
-        return response.data[0] if response.data else None
+        if response.data:
+            return response.data[0]
+        return None
     except Exception as e:
         logger.error(f"কেস আইডি অনুসন্ধানে সমস্যা: {e}")
         return None
@@ -186,69 +179,20 @@ def is_stats_message(text: str) -> bool:
     indicators = ["PARTIAL RESULTS", "STATISTICS", "TOP 5 BALANCES"]
     return any(ind in text for ind in indicators)
 
-# ------------------------ স্ট্যাটাস ব্যাজ ------------------------
-def get_status_badge(status: str) -> str:
-    s = (status or "").strip().lower()
-    if "reject" in s or "cancel" in s or "fail" in s:
-        return "🔴 REJECTED"
-    if "approv" in s or "success" in s or "complete" in s or "paid" in s:
-        return "🟢 APPROVED"
-    if "pending" in s or "process" in s or "wait" in s:
-        return "🟡 PENDING"
-    if not s:
-        return "⚪ UNKNOWN"
-    return f"⚪ {status.upper()}"
-
 # ------------------------ ফরম্যাটিং ------------------------
-def format_single_case(case: dict, index: int | None = None) -> str:
-    date_str, time_str = split_datetime(case.get('created_at', ''))
-    status_badge = get_status_badge(case.get('status', ''))
-
-    # নাম্বার কার্ড লেবেল
-    if index is not None:
-        title_line = f"║  🗂️  <b>CASE #{index}</b>"
-    else:
-        title_line = "║  🗂️  <b>CASE DETAILS</b>"
-
+def format_single_case(case: dict) -> str:
+    created = format_datetime(case.get('created_at', ''))
     return (
-        "╔═══════════════════════════════╗\n"
-        f"{title_line}\n"
-        "╚═══════════════════════════════╝\n"
-        "\n"
-        "┏━━━ 👤 <b>ACCOUNT</b> ━━━┓\n"
-        f"   🔑 <b>Username</b>  :  <code>{safe(case.get('username'))}</code>\n"
-        f"   🔒 <b>Password</b>  :  <code>{safe(case.get('password'))}</code>\n"
-        f"   🆔 <b>Case ID</b>    :  <code>{safe(case.get('case_id'))}</code>\n"
-        f"   📞 <b>Phone</b>       :  <code>{safe(case.get('phone_number'))}</code>\n"
-        "┗━━━━━━━━━━━━━━━━━━━━━━━┛\n"
-        "\n"
-        "┏━━━ 💰 <b>TRANSACTION</b> ━━━┓\n"
-        f"   📱 <b>Platform</b>   :  {safe(case.get('platform'))}\n"
-        f"   📦 <b>Type</b>          :  {safe(case.get('type'))}\n"
-        f"   💳 <b>Payment</b>    :  {safe(case.get('payment_method'))}\n"
-        f"   💵 <b>Amount</b>      :  <b>{safe(case.get('amount'))}</b>\n"
-        "┗━━━━━━━━━━━━━━━━━━━━━━━┛\n"
-        "\n"
-        "┏━━━ 📌 <b>STATUS</b> ━━━┓\n"
-        f"   {status_badge}\n"
-        f"   📝 <i>{safe(case.get('notes'))}</i>\n"
-        "┗━━━━━━━━━━━━━━━━━━━━━━━┛\n"
-        "\n"
-        "┏━━━ 🕒 <b>DATE &amp; TIME</b> ━━━┓\n"
-        f"   📅 <b>Date</b>  :  <code>{date_str}</code>\n"
-        f"   ⏰ <b>Time</b>  :  <code>{time_str}</code>\n"
-        "┗━━━━━━━━━━━━━━━━━━━━━━━┛\n"
-        "\n"
-        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
-    )
-
-def format_multi_case_header(count: int, search_type: str) -> str:
-    return (
-        "╔═══════════════════════════════╗\n"
-        f"║   📊  <b>{count} RESULTS FOUND</b>\n"
-        "╚═══════════════════════════════╝\n"
-        f"<i>🔎 {search_type}</i>\n"
-        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+        f"📋 <b>কেস আইডি:</b> {case.get('case_id', 'N/A')}\n"
+        f"👤 <b>ইউজারনেম:</b> {case.get('username', 'N/A')}\n"
+        f"📞 <b>ফোন:</b> {case.get('phone_number', 'N/A')}\n"
+        f"📱 <b>প্ল্যাটফর্ম:</b> {case.get('platform', 'N/A')}\n"
+        f"📦 <b>টাইপ:</b> {case.get('type', 'N/A')}\n"
+        f"💳 <b>পেমেন্ট মেথড:</b> {case.get('payment_method', 'N/A')}\n"
+        f"💰 <b>অ্যামাউন্ট:</b> {case.get('amount', 'N/A')}\n"
+        f"📌 <b>স্ট্যাটাস:</b> {case.get('status', 'N/A')}\n"
+        f"📝 <b>নোটস:</b> {case.get('notes', 'N/A')}\n"
+        f"🕒 <b>তৈরি হয়েছে:</b> {created}"
     )
 
 # ------------------------ অথেন্টিকেশন কনভারসেশন ------------------------
@@ -256,25 +200,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
+    # ব্লকড হলে কিছু না
     if is_user_blocked(user_id):
-        await update.message.reply_text("⛔ আপনি স্থায়ীভাবে ব্লক হয়ে গেছেন।")
+        await update.message.reply_text("⛔ আপনি স্থায়ীভাবে ব্লক হয়ে গেছেন।")
         return ConversationHandler.END
 
+    # ইতিমধ্যে লগইন করা থাকলে সরাসরি মেনু
     if is_user_authenticated(user_id):
         await update.message.reply_html(
-            "╔═══════════════════════════╗\n"
-            "║  👋  <b>WELCOME BACK</b>  ║\n"
-            "╚═══════════════════════════╝\n\n"
-            "🔎 কেস আইডি / ইউজারনেম / ফোন পাঠান।\n\n"
+            "👋 <b>স্বাগতম!</b>\n\n"
+            "আপনি সরাসরি কেস আইডি, ইউজারনেম বা ফোন নম্বর পাঠাতে পারেন।\n"
             "উদাহরণ:\n"
-            "  ▸ <code>W009201204250</code>\n"
-            "  ▸ <code>bxfarha</code>\n"
-            "  ▸ <code>01307241916</code>\n\n"
-            "📊 পরিসংখ্যান রিপোর্ট ফরওয়ার্ড করলে স্বয়ংক্রিয়ভাবে সব কেস দেখাবে।"
+            "<code>W009201204250</code>\n"
+            "<code>bxfarha</code>\n"
+            "<code>01307241916</code>\n\n"
+            "পরিসংখ্যান রিপোর্ট ফরওয়ার্ড করলে স্বয়ংক্রিয়ভাবে ইউজারনেম বের করে সব কেস দেখাবে।"
         )
         return ConversationHandler.END
 
-    await update.message.reply_text("🔐 দয়া করে আপনার ইমেইল লিখুন:")
+    # লগইন করানো শুরু
+    await update.message.reply_text("🔐 দয়া করে আপনার ইমেইল লিখুন:")
     return ASK_EMAIL
 
 async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -282,19 +227,20 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     email = update.message.text.strip()
 
     if is_user_blocked(user_id):
-        await update.message.reply_text("⛔ আপনি ব্লক হয়ে গেছেন।")
+        await update.message.reply_text("⛔ আপনি ব্লক হয়ে গেছেন।")
         return ConversationHandler.END
 
     if email.lower() != "case@abir.com":
         increment_user_attempts(user_id)
         attempts = get_user_attempts(user_id)
         if is_user_blocked(user_id):
-            await update.message.reply_text("⛔ ৩ বার ভুল দেওয়ায় আপনি স্থায়ীভাবে ব্লক হয়ে গেছেন।")
+            await update.message.reply_text("⛔ ৩ বার ভুল ইমেইল/পাসওয়ার্ড দেওয়ায় আপনি স্থায়ীভাবে ব্লক হয়ে গেছেন।")
             return ConversationHandler.END
         await update.message.reply_text(f"❌ ইমেইল ভুল। আবার চেষ্টা করুন ({attempts}/3):")
         return ASK_EMAIL
 
-    await update.message.reply_text("🔑 এখন পাসওয়ার্ড লিখুন:")
+    # ইমেইল সঠিক
+    await update.message.reply_text("🔑 এখন পাসওয়ার্ড লিখুন:")
     return ASK_PASSWORD
 
 async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -302,108 +248,93 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
 
     if is_user_blocked(user_id):
-        await update.message.reply_text("⛔ আপনি ব্লক হয়ে গেছেন।")
+        await update.message.reply_text("⛔ আপনি ব্লক হয়ে গেছেন।")
         return ConversationHandler.END
 
     if password != "abir.com":
         increment_user_attempts(user_id)
         attempts = get_user_attempts(user_id)
         if is_user_blocked(user_id):
-            await update.message.reply_text("⛔ ৩ বার ভুল দেওয়ায় আপনি স্থায়ীভাবে ব্লক হয়ে গেছেন।")
+            await update.message.reply_text("⛔ ৩ বার ভুল ইমেইল/পাসওয়ার্ড দেওয়ায় আপনি স্থায়ীভাবে ব্লক হয়ে গেছেন।")
             return ConversationHandler.END
-        await update.message.reply_text(f"❌ পাসওয়ার্ড ভুল। আবার চেষ্টা করুন ({attempts}/3):")
+        await update.message.reply_text(f"❌ পাসওয়ার্ড ভুল। আবার চেষ্টা করুন ({attempts}/3):")
         return ASK_PASSWORD
 
+    # সফল লগইন
     authenticate_user(user_id)
-    reset_user_attempts(user_id)
-    await update.message.reply_text("✅ লগইন সফল!")
+    reset_user_attempts(user_id)      # সফল হলে চেষ্টার কাউন্টার রিসেট
+    await update.message.reply_text("✅ লগইন সফল! এখন আপনি কেস অনুসন্ধান করতে পারবেন।")
+    # মেনু দেখানো
     await update.message.reply_html(
-        "╔═══════════════════════════╗\n"
-        "║  👋  <b>WELCOME</b>  ║\n"
-        "╚═══════════════════════════╝\n\n"
-        "🔎 কেস আইডি / ইউজারনেম / ফোন পাঠান।\n\n"
+        "👋 <b>স্বাগতম!</b>\n\n"
+        "আপনি সরাসরি কেস আইডি, ইউজারনেম বা ফোন নম্বর পাঠাতে পারেন।\n"
         "উদাহরণ:\n"
-        "  ▸ <code>W009201204250</code>\n"
-        "  ▸ <code>bxfarha</code>\n"
-        "  ▸ <code>01307241916</code>\n\n"
-        "📊 পরিসংখ্যান রিপোর্ট ফরওয়ার্ড করলে স্বয়ংক্রিয়ভাবে সব কেস দেখাবে।"
+        "<code>W009201204250</code>\n"
+        "<code>bxfarha</code>\n"
+        "<code>01307241916</code>\n\n"
+        "পরিসংখ্যান রিপোর্ট ফরওয়ার্ড করলে স্বয়ংক্রিয়ভাবে ইউজারনেম বের করে সব কেস দেখাবে।"
     )
     return ConversationHandler.END
 
 async def cancel_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚫 অথেন্টিকেশন বাতিল। /start দিয়ে আবার চেষ্টা করুন।")
+    await update.message.reply_text("🚫 অথেন্টিকেশন বাতিল করা হয়েছে। /start দিয়ে আবার চেষ্টা করুন।")
     return ConversationHandler.END
 
-# ------------------------ চাঙ্কড সেন্ড হেল্পার ------------------------
-async def send_long_message(update: Update, text: str, limit: int = 3800):
-    if len(text) <= limit:
-        await update.message.reply_html(text)
-        return
-
-    parts = text.split("\n\n")
-    chunk = ""
-    for part in parts:
-        piece = part + "\n\n"
-        if len(chunk) + len(piece) > limit:
-            if chunk.strip():
-                await update.message.reply_html(chunk.strip())
-            chunk = piece
-        else:
-            chunk += piece
-    if chunk.strip():
-        await update.message.reply_html(chunk.strip())
-
-# ------------------------ মেসেজ হ্যান্ডলার ------------------------
+# ------------------------ মেসেজ হ্যান্ডলার (সার্চ) ------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     text = update.message.text.strip()
 
+    # ব্লক চেক
     if is_user_blocked(user_id):
-        await update.message.reply_text("⛔ আপনি ব্লক হয়ে গেছেন।")
+        await update.message.reply_text("⛔ আপনি ব্লক হয়ে গেছেন।")
         return
 
+    # অথেন্টিকেটেড কিনা
     if not is_user_authenticated(user_id):
-        await update.message.reply_text("🔐 অনুগ্রহ করে /start দিয়ে লগইন করুন।")
+        await update.message.reply_text("🔐 অনুগ্রহ করে /start দিয়ে লগইন করুন।")
         return
 
+    # ---------- মূল সার্চ লজিক ----------
     await update.message.chat.send_action(action="typing")
 
-    # ---------- স্ট্যাটস ----------
+    # পরিসংখ্যান মেসেজ
     if is_stats_message(text):
         usernames = extract_usernames_from_stats(text)
         if not usernames:
-            await update.message.reply_text("❌ মেসেজে কোনো ইউজারনেম পাওয়া যায়নি।")
+            await update.message.reply_text("❌ মেসেজে কোনো ইউজারনেম খুঁজে পাওয়া যায়নি।")
             return
-
         all_results = []
-        seen_ids = set()
-        for uname in usernames:
-            for c in search_by_username(uname):
-                cid = c.get("case_id")
-                if cid and cid not in seen_ids:
-                    seen_ids.add(cid)
-                    all_results.append(c)
-
+        for user_name in usernames:
+            cases = search_by_username(user_name)
+            if cases:
+                all_results.extend(cases)
         if not all_results:
-            await update.message.reply_text("❌ কোনো কেস পাওয়া যায়নি।")
+            await update.message.reply_text("❌ কোনো ইউজারনেমের জন্য কেস পাওয়া যায়নি।")
             return
-
-        header = format_multi_case_header(len(all_results), f"স্ট্যাটস রিপোর্ট ({len(usernames)} ইউজারনেম)")
-        parts = [format_single_case(c, index=i + 1) for i, c in enumerate(all_results)]
-        await send_long_message(update, header + "\n\n" + "\n\n".join(parts))
+        output_parts = [format_single_case(c) for c in all_results]
+        chunk = ""
+        for part in output_parts:
+            if len(chunk) + len(part) > 3800:
+                await update.message.reply_html(chunk)
+                chunk = part
+            else:
+                chunk += "\n\n---\n\n" + part if chunk else part
+        if chunk:
+            await update.message.reply_html(chunk)
         return
 
-    # ---------- কেস আইডি ----------
+    # কেস আইডি
     if is_case_id(text):
         case = search_by_case_id(text)
         if case:
             await update.message.reply_html(format_single_case(case))
         else:
-            await update.message.reply_html("❌ এই কেস আইডি পাওয়া যায়নি।")
+            await update.message.reply_html("❌ এই কেস আইডি পাওয়া যায়নি।")
         return
 
-    # ---------- ফোন / ইউজারনেম ----------
+    # ফোন বা ইউজারনেম
     if is_phone_number(text):
         results = search_by_phone(text)
         search_type = "ফোন নম্বর"
@@ -412,36 +343,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         search_type = "ইউজারনেম"
 
     if not results:
-        await update.message.reply_html(f"❌ এই {search_type} দিয়ে কোনো কেস পাওয়া যায়নি।")
+        await update.message.reply_html(f"❌ এই {search_type} দিয়ে কোনো কেস পাওয়া যায়নি।")
         return
 
     if len(results) == 1:
         await update.message.reply_html(format_single_case(results[0]))
-        return
-
-    limit = 5
-    shown = results[:limit]
-    header = format_multi_case_header(len(results), f"{search_type}: <code>{safe(text)}</code>")
-    parts = [format_single_case(c, index=i + 1) for i, c in enumerate(shown)]
-    full_text = header + "\n\n" + "\n\n".join(parts)
-    if len(results) > limit:
-        full_text += f"\n\n<i>… আরও {len(results) - limit} টি কেস আছে।</i>"
-
-    await send_long_message(update, full_text)
+    else:
+        limit = 5
+        parts = [format_single_case(c) for c in results[:limit]]
+        text = "\n\n---\n\n".join(parts)
+        if len(results) > limit:
+            text += f"\n\n<i>... এবং আরও {len(results) - limit} টি কেস আছে। আরও নির্দিষ্ট তথ্য দিন।</i>"
+        await update.message.reply_html(text)
 
 # ------------------------ এরর হ্যান্ডলার ------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="আপডেট প্রসেস করতে সমস্যা:", exc_info=context.error)
     if update and isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text("⚠️ একটি সমস্যা হয়েছে, পরে চেষ্টা করুন।")
-        except Exception:
-            pass
+        await update.effective_message.reply_text("⚠️ একটি সমস্যা হয়েছে, পরে চেষ্টা করুন।")
 
 # ------------------------ মেইন ------------------------
 def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # অথেন্টিকেশন কনভারসেশন
     auth_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_command)],
         states={
@@ -452,9 +377,11 @@ def main():
     )
     application.add_handler(auth_conv)
 
+    # সাধারণ মেসেজ (সার্চ)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
 
+    # Python 3.14+ ইভেন্ট লুপ
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
